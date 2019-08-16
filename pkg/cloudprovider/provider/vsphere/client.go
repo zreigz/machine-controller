@@ -29,9 +29,16 @@ import (
 )
 
 type Session struct {
-	Client     *govmomi.Client
-	Finder     *find.Finder
-	Datacenter *object.Datacenter
+	Client            *govmomi.Client
+	Finder            *find.Finder
+	Datacenter        *object.Datacenter
+	DatacenterFolders *object.DatacenterFolders
+	Datastore         *object.Datastore
+}
+
+type Folders struct {
+	VM        string
+	Datastore string
 }
 
 // NewSession creates a vCenter client with initialized finder
@@ -54,10 +61,22 @@ func NewSession(ctx context.Context, config *Config) (*Session, error) {
 	}
 	finder.SetDatacenter(dc)
 
+	datacenterFolders, err := dc.Folders(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load datacenter folders: %v", err)
+	}
+
+	datastore, err := finder.Datastore(ctx, config.Datastore)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get datastore: %v", err)
+	}
+
 	return &Session{
-		Client:     client,
-		Finder:     finder,
-		Datacenter: dc,
+		Client:            client,
+		Finder:            finder,
+		Datacenter:        dc,
+		DatacenterFolders: datacenterFolders,
+		Datastore:         datastore,
 	}, nil
 }
 

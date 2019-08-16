@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/golang/glog"
@@ -30,7 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ktypes "k8s.io/apimachinery/pkg/types"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/cluster-api/pkg/apis/cluster/common"
 	"sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -61,71 +60,45 @@ type provider struct {
 	configVarResolver *providerconfig.ConfigVarResolver
 }
 
-type netDeviceAndBackingInfo struct {
-	device      *types.BaseVirtualDevice
-	backingInfo *types.VirtualEthernetCardNetworkBackingInfo
-}
-
 // New returns a VSphere provider
 func New(configVarResolver *providerconfig.ConfigVarResolver) cloudprovidertypes.Provider {
 	return &provider{configVarResolver: configVarResolver}
 }
 
 type RawConfig struct {
-	TemplateVMName  providerconfig.ConfigVarString `json:"templateVMName"`
-	TemplateNetName providerconfig.ConfigVarString `json:"templateNetName,omitempty"`
-	VMNetName       providerconfig.ConfigVarString `json:"vmNetName,omitempty"`
-	Username        providerconfig.ConfigVarString `json:"username,omitempty"`
-	Password        providerconfig.ConfigVarString `json:"password,omitempty"`
-	VSphereURL      providerconfig.ConfigVarString `json:"vsphereURL,omitempty"`
-	Datacenter      providerconfig.ConfigVarString `json:"datacenter"`
-	Cluster         providerconfig.ConfigVarString `json:"cluster"`
-	Folder          providerconfig.ConfigVarString `json:"folder,omitempty"`
-	Datastore       providerconfig.ConfigVarString `json:"datastore"`
-	CPUs            int32                          `json:"cpus"`
-	MemoryMB        int64                          `json:"memoryMB"`
-	DiskSizeGB      *int64                         `json:"diskSizeGB,omitempty"`
-	AllowInsecure   providerconfig.ConfigVarBool   `json:"allowInsecure"`
+	TemplateVMName providerconfig.ConfigVarString `json:"templateVMName"`
+	// Deprecated. Use Networks instead
+	VMNetName     providerconfig.ConfigVarString `json:"vmNetName,omitempty"`
+	Networks      []string                       `json:"networks"`
+	Username      providerconfig.ConfigVarString `json:"username,omitempty"`
+	Password      providerconfig.ConfigVarString `json:"password,omitempty"`
+	VSphereURL    providerconfig.ConfigVarString `json:"vsphereURL,omitempty"`
+	Datacenter    providerconfig.ConfigVarString `json:"datacenter"`
+	Cluster       providerconfig.ConfigVarString `json:"cluster"`
+	Folder        providerconfig.ConfigVarString `json:"folder,omitempty"`
+	Datastore     providerconfig.ConfigVarString `json:"datastore"`
+	CPUs          int32                          `json:"cpus"`
+	MemoryMB      int64                          `json:"memoryMB"`
+	DiskSizeGB    *int64                         `json:"diskSizeGB,omitempty"`
+	AllowInsecure providerconfig.ConfigVarBool   `json:"allowInsecure"`
 }
 
 type Config struct {
-	TemplateVMName  string
-	TemplateNetName string
-	VMNetName       string
-	Username        string
-	Password        string
-	VSphereURL      string
-	Datacenter      string
-	Cluster         string
-	Folder          string
-	Datastore       string
-	AllowInsecure   bool
-	CPUs            int32
-	MemoryMB        int64
-	DiskSizeGB      *int64
-}
-
-type Server struct {
-	name      string
-	id        string
-	status    instance.Status
-	addresses []string
-}
-
-func (vsphereServer Server) Name() string {
-	return vsphereServer.name
-}
-
-func (vsphereServer Server) ID() string {
-	return vsphereServer.id
-}
-
-func (vsphereServer Server) Addresses() []string {
-	return vsphereServer.addresses
-}
-
-func (vsphereServer Server) Status() instance.Status {
-	return vsphereServer.status
+	TemplateVMName string
+	// Deprecated
+	VMNetName     string
+	Networks      []string
+	Username      string
+	Password      string
+	VSphereURL    string
+	Datacenter    string
+	Cluster       string
+	Folder        string
+	Datastore     string
+	AllowInsecure bool
+	CPUs          int32
+	MemoryMB      int64
+	DiskSizeGB    *int64
 }
 
 func (p *provider) AddDefaults(spec v1alpha1.MachineSpec) (v1alpha1.MachineSpec, error) {
@@ -138,32 +111,11 @@ func (p *provider) AddDefaults(spec v1alpha1.MachineSpec) (v1alpha1.MachineSpec,
 	}
 
 	// default templatenetname to network of template if none specific was given and only one adapter exists.
-	if cfg.TemplateNetName == "" && cfg.VMNetName != "" {
-		ctx := context.TODO()
-		session, err := NewSession(ctx, cfg)
-		if err != nil {
-			return spec, fmt.Errorf("failed to create vCenter session: %v", err)
-		}
-		defer session.Logout()
-
-		templateVM, err := session.Finder.VirtualMachine(ctx, cfg.TemplateVMName)
-		if err != nil {
-			return spec, fmt.Errorf("failed to get virtual machine: %v", err)
-		}
-
-		availableNetworkDevices, err := getNetworkDevicesAndBackingsFromVM(ctx, templateVM, "")
-		if err != nil {
-			return spec, fmt.Errorf("failed to get network devices for vm: %v", err)
-		}
-
-		if len(availableNetworkDevices) == 0 {
-			glog.V(6).Infof("found no network adapter to default to in template vm %s", cfg.TemplateVMName)
-		} else if len(availableNetworkDevices) > 1 {
-			glog.V(6).Infof("found multiple network adapters in template vm %s but no explicit template net name is specified in the cluster", cfg.TemplateVMName)
-		} else {
-			eth := availableNetworkDevices[0].backingInfo
-			rawCfg.TemplateNetName.Value = eth.DeviceName
-		}
+	if cfg.VMNetName != "" {
+		// In case we have still a mention of network, we just copy it over
+		networks := sets.NewString(cfg.Networks...)
+		networks.Insert(cfg.VMNetName)
+		cfg.Networks = networks.List()
 	}
 
 	spec.ProviderSpec.Value, err = setProviderSpec(*rawCfg, spec.ProviderSpec)
@@ -217,10 +169,8 @@ func (p *provider) getConfig(s v1alpha1.ProviderSpec) (*Config, *providerconfig.
 		return nil, nil, nil, err
 	}
 
-	c.TemplateNetName, err = p.configVarResolver.GetConfigVarStringValue(rawConfig.TemplateNetName)
-	if err != nil {
-		return nil, nil, nil, err
-	}
+	c.Networks = make([]string, len(rawConfig.Networks))
+	copy(c.Networks, rawConfig.Networks)
 
 	c.VMNetName, err = p.configVarResolver.GetConfigVarStringValue(rawConfig.VMNetName)
 	if err != nil {
@@ -282,8 +232,8 @@ func (p *provider) Validate(spec v1alpha1.MachineSpec) error {
 		return fmt.Errorf("failed to get config: %v", err)
 	}
 
-	if config.VMNetName != "" && config.TemplateNetName == "" {
-		return errors.New("specified target network (VMNetName) in cluster, but no source network (TemplateNetName) in machine")
+	if config.VMNetName == "" && len(config.Networks) == 0 {
+		return errors.New("at least one network must be specified")
 	}
 
 	if config.CPUs > 8 {
@@ -296,10 +246,6 @@ func (p *provider) Validate(spec v1alpha1.MachineSpec) error {
 	}
 	defer session.Logout()
 
-	if _, err := session.Finder.Datastore(ctx, config.Datastore); err != nil {
-		return fmt.Errorf("failed to get datastore %s: %v", config.Datastore, err)
-	}
-
 	if _, err := session.Finder.ClusterComputeResource(ctx, config.Cluster); err != nil {
 		return fmt.Errorf("failed to get cluster: %s: %v", config.Cluster, err)
 	}
@@ -309,16 +255,13 @@ func (p *provider) Validate(spec v1alpha1.MachineSpec) error {
 		return fmt.Errorf("failed to get template vm %q: %v", config.TemplateVMName, err)
 	}
 
-	disks, err := getDisksFromVM(ctx, templateVM)
+	vmDevices, err := templateVM.Device(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get disks from VM: %v", err)
-	}
-	if diskLen := len(disks); diskLen != 1 {
-		return fmt.Errorf("expected vm to have exactly one disk, had %d", diskLen)
+		return fmt.Errorf("failed to list devices of tempalte VM: %v", err)
 	}
 
 	if config.DiskSizeGB != nil {
-		if err := validateDiskResizing(disks, *config.DiskSizeGB); err != nil {
+		if err := validateDiskResize(vmDevices, *config.DiskSizeGB); err != nil {
 			return err
 		}
 	}
@@ -334,8 +277,7 @@ func machineInvalidConfigurationTerminalError(err error) error {
 }
 
 func (p *provider) Create(machine *v1alpha1.Machine, _ *cloudprovidertypes.ProviderData, userdata string) (instance.Instance, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 
 	config, pc, _, err := p.getConfig(machine.Spec.ProviderSpec)
 	if err != nil {
@@ -348,45 +290,16 @@ func (p *provider) Create(machine *v1alpha1.Machine, _ *cloudprovidertypes.Provi
 	}
 	defer session.Logout()
 
-	var containerLinuxUserdata string
-	if pc.OperatingSystem == providerconfig.OperatingSystemCoreos {
-		containerLinuxUserdata = userdata
-	}
-
-	virtualMachine, err := createClonedVM(ctx,
+	virtualMachine, err := createClonedVM(
+		ctx,
 		machine.Spec.Name,
 		config,
 		session,
-		containerLinuxUserdata,
+		pc.OperatingSystem,
+		userdata,
 	)
 	if err != nil {
 		return nil, machineInvalidConfigurationTerminalError(fmt.Errorf("failed to create cloned vm: '%v'", err))
-	}
-
-	if pc.OperatingSystem != providerconfig.OperatingSystemCoreos {
-		localUserdataIsoFilePath, err := generateLocalUserdataISO(userdata, machine.Spec.Name)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate local userdadata iso: %v", err)
-		}
-
-		defer func() {
-			err := os.Remove(localUserdataIsoFilePath)
-			if err != nil {
-				utilruntime.HandleError(fmt.Errorf("failed to clean up local userdata iso file at %s: %v", localUserdataIsoFilePath, err))
-			}
-		}()
-
-		if err := uploadAndAttachISO(ctx, session, virtualMachine, localUserdataIsoFilePath, config.Datastore); err != nil {
-			// Destroy VM to avoid a leftover.
-			destroyTask, vmErr := virtualMachine.Destroy(ctx)
-			if vmErr != nil {
-				return nil, fmt.Errorf("failed to destroy vm %s after failing upload and attach userdata iso: %v / %v", virtualMachine.Name(), err, vmErr)
-			}
-			if vmErr := destroyTask.Wait(ctx); vmErr != nil {
-				return nil, fmt.Errorf("failed to destroy vm %s after failing upload and attach userdata iso: %v / %v", virtualMachine.Name(), err, vmErr)
-			}
-			return nil, machineInvalidConfigurationTerminalError(fmt.Errorf("failed to upload and attach userdata iso: %v", err))
-		}
 	}
 
 	powerOnTask, err := virtualMachine.PowerOn(ctx)
@@ -512,17 +425,8 @@ func (p *provider) Cleanup(machine *v1alpha1.Machine, data *cloudprovidertypes.P
 	}
 
 	if pc.OperatingSystem != providerconfig.OperatingSystemCoreos {
-		datastore, err := session.Finder.Datastore(ctx, config.Datastore)
-		if err != nil {
-			return false, fmt.Errorf("failed to get datastore %s: %v", config.Datastore, err)
-		}
-		filemanager := datastore.NewFileManager(session.Datacenter, false)
-
-		if err := filemanager.Delete(ctx, virtualMachine.Name()); err != nil {
-			if err.Error() == fmt.Sprintf("File [%s] %s was not found", datastore.Name(), virtualMachine.Name()) {
-				return true, nil
-			}
-			return false, fmt.Errorf("failed to delete storage of deleted instance %s: %v", virtualMachine.Name(), err)
+		if err := removeUserdataISO(ctx, session, machine.Name); err != nil {
+			return false, err
 		}
 	}
 
@@ -620,7 +524,7 @@ func (p *provider) Get(machine *v1alpha1.Machine, data *cloudprovidertypes.Provi
 				}
 			}
 		} else {
-			glog.V(3).Infof("vmware guest utils for machine %s are not running, can't match it to a node!", machine.Spec.Name)
+			glog.V(3).Infof("Can't fetch the IP addresses for machine %s, the VMware guest utils are not running yet. This might take a few minutes", machine.Spec.Name)
 		}
 	}
 
