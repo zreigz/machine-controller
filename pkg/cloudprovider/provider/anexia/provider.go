@@ -49,7 +49,6 @@ type Config struct {
 	CPUs       int
 	Memory     int
 	DiskSize   int
-	SSHKey     string
 }
 
 type provider struct {
@@ -109,7 +108,7 @@ func (p *provider) AddDefaults(spec v1alpha1.MachineSpec) (v1alpha1.MachineSpec,
 	return spec, nil
 }
 
-// Validate returns success or failure based according to its FakeCloudProviderSpec
+// Validate returns success or failure based according to its ProviderSpec
 func (p *provider) Validate(machinespec v1alpha1.MachineSpec) error {
 	config, _, err := p.getConfig(machinespec.ProviderSpec)
 	if err != nil {
