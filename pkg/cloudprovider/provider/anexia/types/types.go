@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	AnxTokenEnv = "ANXCLOUD_TOKEN"
+	AnxTokenEnv = "ANEXIA_TOKEN"
 
 	CreateRequestTimeout = 15 * time.Minute
 	GetRequestTimeout    = 1 * time.Minute
@@ -41,11 +41,4 @@ type RawConfig struct {
 	CPUs       int                                 `json:"cpus"`
 	Memory     int                                 `json:"memory"`
 	DiskSize   int                                 `json:"diskSize"`
-}
-
-type ProviderStatus struct {
-	InstanceID     string `json:"instanceID"`
-	ProvisioningID string `json:"provisioningID"`
-	IPAllocationID string `json:"ipAllocationID"`
-	// TODO: add conditions to track progress on the provider side
 }

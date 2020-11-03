@@ -24,6 +24,10 @@ import (
 	"fmt"
 	"net/http"
 
+	anx "github.com/anexia-it/go-anxcloud/pkg"
+	anxclient "github.com/anexia-it/go-anxcloud/pkg/client"
+	anxvm "github.com/anexia-it/go-anxcloud/pkg/vsphere/provisioning/vm"
+
 	"github.com/kubermatic/machine-controller/pkg/apis/cluster/common"
 	"github.com/kubermatic/machine-controller/pkg/apis/cluster/v1alpha1"
 	"github.com/kubermatic/machine-controller/pkg/cloudprovider/common/ssh"
@@ -34,10 +38,6 @@ import (
 	"github.com/kubermatic/machine-controller/pkg/providerconfig"
 	providerconfigtypes "github.com/kubermatic/machine-controller/pkg/providerconfig/types"
 
-	anx "github.com/anexia-it/go-anxcloud/pkg"
-	anxclient "github.com/anexia-it/go-anxcloud/pkg/client"
-	anxvm "github.com/anexia-it/go-anxcloud/pkg/vsphere/provisioning/vm"
-	"k8s.io/apimachinery/pkg/runtime"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 )
 
@@ -154,20 +154,26 @@ func (p *provider) Get(machine *v1alpha1.Machine, _ *cloudprovidertypes.Provider
 	}
 
 	apiClient := getClient(config.Token)
-	status, err := getStatus(machine.Status.ProviderStatus)
-	if err != nil {
-		return nil, newError(common.InvalidConfigurationMachineError, "failed to get machine status: %v", err)
-	}
-	if status.InstanceID == "" {
-		return nil, cloudprovidererrors.ErrInstanceNotFound
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), anxtypes.GetRequestTimeout)
 	defer cancel()
 
-	info, err := apiClient.VSphere().Info().Get(ctx, status.InstanceID)
+	hostname := fmt.Sprintf("%s-%s-%s", "%", machine.Name, machine.UID)
+	vms, err := apiClient.VSphere().Search().ByName(ctx, hostname)
 	if err != nil {
 		return nil, fmt.Errorf("failed get machine info: %w", err)
+	}
+
+	if len(vms) < 1 {
+		return nil, cloudprovidererrors.ErrInstanceNotFound
+	}
+
+	info, err := apiClient.VSphere().Info().Get(ctx, vms[0].Identifier)
+	if err != nil {
+		return nil, fmt.Errorf("failed get machine info: %w", err)
+	}
+
+	if info.Status != anxtypes.MachinePoweredOn {
+		return nil, fmt.Errorf("instance %s has not started yet, power on is in progress", info.Identifier)
 	}
 
 	return &anexiaInstance{
@@ -175,7 +181,7 @@ func (p *provider) Get(machine *v1alpha1.Machine, _ *cloudprovidertypes.Provider
 	}, nil
 }
 
-func (p *provider) GetCloudConfig(spec v1alpha1.MachineSpec) (string, string, error) {
+func (p *provider) GetCloudConfig(_ v1alpha1.MachineSpec) (string, string, error) {
 	return "", "", nil
 }
 
@@ -190,103 +196,74 @@ func (p *provider) Create(machine *v1alpha1.Machine, providerData *cloudprovider
 	ctx, cancel := context.WithTimeout(context.Background(), anxtypes.CreateRequestTimeout)
 	defer cancel()
 
-	status, err := getStatus(machine.Status.ProviderStatus)
+	ips, err := apiClient.VSphere().Provisioning().IPs().GetFree(ctx, config.LocationID, config.VlanID)
 	if err != nil {
-		return nil, newError(common.InvalidConfigurationMachineError, "failed to get machine status: %v", err)
+		return nil, newError(common.InvalidConfigurationMachineError, "failed to get ip pool: %v", err)
+	}
+	if len(ips) < 1 {
+		return nil, newError(common.InsufficientResourcesMachineError, "no ip address is available for this machine")
 	}
 
-	if status.ProvisioningID == "" {
-		ips, err := apiClient.VSphere().Provisioning().IPs().GetFree(ctx, config.LocationID, config.VlanID)
-		if err != nil {
-			return nil, newError(common.InvalidConfigurationMachineError, "failed to get ip pool: %v", err)
-		}
-		if len(ips) < 1 {
-			return nil, newError(common.InsufficientResourcesMachineError, "no ip address is available for this machine")
-		}
+	ipID := ips[0].Identifier
+	networkInterfaces := []anxvm.Network{{
+		NICType: anxtypes.VmxNet3NIC,
+		IPs:     []string{ipID},
+		VLAN:    config.VlanID,
+	}}
 
-		ipID := ips[0].Identifier
-		networkInterfaces := []anxvm.Network{{
-			NICType: anxtypes.VmxNet3NIC,
-			IPs:     []string{ipID},
-			VLAN:    config.VlanID,
-		}}
+	hostname := fmt.Sprintf("%s-%s", machine.Name, machine.UID)
 
-		vm := apiClient.VSphere().Provisioning().VM().NewDefinition(
-			config.LocationID,
-			"templates",
-			config.TemplateID,
-			machine.ObjectMeta.Name,
-			config.CPUs,
-			config.Memory,
-			config.DiskSize,
-			networkInterfaces,
-		)
+	vm := apiClient.VSphere().Provisioning().VM().NewDefinition(
+		config.LocationID,
+		"templates",
+		config.TemplateID,
+		hostname,
+		config.CPUs,
+		config.Memory,
+		config.DiskSize,
+		networkInterfaces,
+	)
 
-		vm.Script = base64.StdEncoding.EncodeToString(
-			[]byte(fmt.Sprintf("anexia: true\n\n%s", userdata)),
-		)
+	vm.Script = base64.StdEncoding.EncodeToString(
+		[]byte(fmt.Sprintf("anexia: true\n\n%s", userdata)),
+	)
 
-		sshKey, err := ssh.NewKey()
-		if err != nil {
-			return nil, newError(common.CreateMachineError, "failed to generate ssh key: %v", err)
-		}
-		vm.SSH = sshKey.PublicKey
-
-		provisionResponse, err := apiClient.VSphere().Provisioning().VM().Provision(ctx, vm)
-		if err != nil {
-			return nil, newError(common.CreateMachineError, "instance provisioning failed: %v", err)
-		}
-
-		status.ProvisioningID = provisionResponse.Identifier
-		status.IPAllocationID = ipID
-		if err := updateStatus(machine, status, providerData.Update); err != nil {
-			return nil, newError(common.UpdateMachineError, "machine status update failed: %v", err)
-		}
+	sshKey, err := ssh.NewKey()
+	if err != nil {
+		return nil, newError(common.CreateMachineError, "failed to generate ssh key: %v", err)
 	}
+	vm.SSH = sshKey.PublicKey
 
-	instanceID, err := apiClient.VSphere().Provisioning().Progress().AwaitCompletion(ctx, status.ProvisioningID)
+	_, err = apiClient.VSphere().Provisioning().VM().Provision(ctx, vm)
 	if err != nil {
 		return nil, newError(common.CreateMachineError, "instance provisioning failed: %v", err)
-	}
-
-	status.InstanceID = instanceID
-	if err := updateStatus(machine, status, providerData.Update); err != nil {
-		return nil, newError(common.UpdateMachineError, "machine status update failed: %v", err)
 	}
 
 	return p.Get(machine, providerData)
 }
 
-func (p *provider) Cleanup(machine *v1alpha1.Machine, _ *cloudprovidertypes.ProviderData) (bool, error) {
+func (p *provider) Cleanup(machine *v1alpha1.Machine, providerData *cloudprovidertypes.ProviderData) (bool, error) {
 	config, _, err := p.getConfig(machine.Spec.ProviderSpec)
 	if err != nil {
 		return false, newError(common.InvalidConfigurationMachineError, "failed to parse MachineSpec: %v", err)
 	}
 
 	apiClient := getClient(config.Token)
-	status, err := getStatus(machine.Status.ProviderStatus)
-	if err != nil {
-		return false, newError(common.InvalidConfigurationMachineError, "failed to get machine status: %v", err)
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), anxtypes.DeleteRequestTimeout)
 	defer cancel()
 
-	err = apiClient.VSphere().Provisioning().VM().Deprovision(ctx, status.InstanceID, false)
+	vm, err := p.Get(machine, providerData)
+	if err != nil {
+		return false, err
+	}
+
+	err = apiClient.VSphere().Provisioning().VM().Deprovision(ctx, vm.ID(), false)
 	if err != nil {
 		var respErr *anxclient.ResponseError
 		// Only error if the error was not "not found"
 		if !(errors.As(err, &respErr) && respErr.ErrorData.Code == http.StatusNotFound) {
 			return false, newError(common.DeleteMachineError, "failed to delete machine: %v", err)
-		}
-	}
-
-	err = apiClient.IPAM().Address().Delete(ctx, status.IPAllocationID)
-	if err != nil {
-		var respErr *anxclient.ResponseError
-		// Only error if the error was not "not found"
-		if !(errors.As(err, &respErr) && respErr.ErrorData.Code == http.StatusNotFound) {
-			return false, newError(common.DeleteMachineError, "failed to delete machine ip allocation: %v", err)
 		}
 	}
 
@@ -297,11 +274,11 @@ func (p *provider) MigrateUID(_ *v1alpha1.Machine, _ k8stypes.UID) error {
 	return nil
 }
 
-func (p *provider) MachineMetricsLabels(machine *v1alpha1.Machine) (map[string]string, error) {
+func (p *provider) MachineMetricsLabels(_ *v1alpha1.Machine) (map[string]string, error) {
 	return map[string]string{}, nil
 }
 
-func (p *provider) SetMetricsForMachines(machine v1alpha1.MachineList) error {
+func (p *provider) SetMetricsForMachines(_ v1alpha1.MachineList) error {
 	return nil
 }
 
@@ -310,37 +287,10 @@ func getClient(token string) anx.API {
 	return anx.NewAPI(client)
 }
 
-func getStatus(rawStatus *runtime.RawExtension) (*anxtypes.ProviderStatus, error) {
-	var status anxtypes.ProviderStatus
-	if rawStatus != nil && rawStatus.Raw != nil {
-		if err := json.Unmarshal(rawStatus.Raw, &status); err != nil {
-			return nil, err
-		}
-	}
-	return &status, nil
-}
-
 // newError creates a terminal error matching to the provider interface.
 func newError(reason common.MachineStatusError, msg string, args ...interface{}) error {
 	return cloudprovidererrors.TerminalError{
 		Reason:  reason,
 		Message: fmt.Sprintf(msg, args...),
 	}
-}
-
-func updateStatus(machine *v1alpha1.Machine, status *anxtypes.ProviderStatus, updater cloudprovidertypes.MachineUpdater) error {
-	rawStatus, err := json.Marshal(status)
-	if err != nil {
-		return err
-	}
-	err = updater(machine, func(machine *v1alpha1.Machine) {
-		machine.Status.ProviderStatus = &runtime.RawExtension{
-			Raw: rawStatus,
-		}
-	})
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
